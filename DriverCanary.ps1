@@ -6,7 +6,8 @@ Inventories kernel driver files and alerts on unapproved kernel image loads via 
 One-file, inbox-only Windows implementation. Embedded C# uses ETW, TDH and DNS APIs;
 PowerShell performs inventory and Authenticode enrichment. No Python, Sysmon, SDK,
 NuGet package, vulnerable driver, or third-party monitoring service is required.
-Requires native x64 Windows PowerShell 5.1, elevation, and FullLanguage mode.
+Targets x64 Windows 10/11 and ARM64 Windows 11 (including Parallels guests).
+Requires 64-bit Windows PowerShell 5.1, elevation, and FullLanguage mode.
 See README.md for coverage, baseline review, deployment and a Procmon load test.
 .PARAMETER Mode
 Inventory writes an unapproved candidate inventory. Approve creates a separate
@@ -34,8 +35,15 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitProcess -or
-    $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Use native x64 Windows PowerShell on x64 Windows 10/11.' }
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    throw 'DriverCanary requires Windows. ETW driver monitoring cannot run on this operating system.'
+}
+if (-not [Environment]::Is64BitProcess) {
+    if ([Environment]::Is64BitOperatingSystem) {
+        throw "This is a 32-bit PowerShell process. From this shell, open native PowerShell with: Start-Process -FilePath `"`$env:SystemRoot\Sysnative\WindowsPowerShell\v1.0\powershell.exe`" -Verb RunAs . Then run this script in the new window with the same parameters."
+    }
+    throw '32-bit Windows is unsupported. Use x64 Windows 10/11 or ARM64 Windows 11.'
+}
 if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { throw 'FullLanguage is required for Add-Type; do not weaken organizational policy to run this.' }
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run Windows PowerShell as administrator.' }
@@ -43,7 +51,13 @@ if (-not $InventoryPath) { $InventoryPath = Join-Path $DataDirectory 'inventory.
 if (-not $BaselinePath) { $BaselinePath = Join-Path $DataDirectory 'approved.json' }
 [IO.Directory]::CreateDirectory($DataDirectory) | Out-Null
 
-# Fixed native layouts below are deliberately restricted to x64. Never run via SysWOW64.
+# Windows x64 and ARM64 share these 64-bit ETW layouts. Never run via SysWOW64.
+# Use a fresh PowerShell window when upgrading: Add-Type definitions cannot be replaced.
+if ('DriverCanary.Native' -as [type]) {
+    if (-not [DriverCanary.Native].GetMethod('PlatformInfo')) {
+        throw 'An older DriverCanary version is already loaded. Open a new elevated PowerShell window and run this updated script there.'
+    }
+}
 if (-not ('DriverCanary.Native' -as [type])) {
 Add-Type -Language CSharp -TypeDefinition @'
 using System;
@@ -64,6 +78,56 @@ namespace DriverCanary {
         public bool Approved;
     }
     public static class Native {
+        [StructLayout(LayoutKind.Sequential)] struct SystemInfo {
+            public ushort Architecture, Reserved;
+            public uint PageSize;
+            public IntPtr MinimumApplicationAddress, MaximumApplicationAddress;
+            public UIntPtr ActiveProcessorMask;
+            public uint NumberOfProcessors, ProcessorType, AllocationGranularity;
+            public ushort ProcessorLevel, ProcessorRevision;
+        }
+        [DllImport("kernel32.dll",SetLastError=true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool IsWow64Process2(IntPtr process,out ushort processMachine,out ushort nativeMachine);
+        [DllImport("kernel32.dll")] static extern void GetSystemInfo(out SystemInfo info);
+        static string MachineName(ushort machine) {
+            switch(machine) {
+                case 0: return "Native";
+                case 0x8664: return "X64";
+                case 0xAA64: return "ARM64";
+                case 0xA641: return "ARM64EC";
+                case 0x14c: return "X86";
+                default: return "0x"+machine.ToString("X4");
+            }
+        }
+        public static string PlatformInfo() {
+            if(IntPtr.Size!=8) throw new PlatformNotSupportedException("64-bit PowerShell is required");
+            ushort processMachine,nativeMachine;
+            try {
+                if(!IsWow64Process2(GetCurrentProcess(),out processMachine,out nativeMachine))
+                    throw new IOException("IsWow64Process2 failed: "+Marshal.GetLastWin32Error());
+            } catch(EntryPointNotFoundException) {
+                throw new PlatformNotSupportedException("Windows 10 version 1709 or later, or Windows 11, is required");
+            }
+            if(nativeMachine!=0x8664 && nativeMachine!=0xAA64)
+                throw new PlatformNotSupportedException("Unsupported Windows architecture: "+MachineName(nativeMachine));
+            if(processMachine!=0 && processMachine!=0x8664 && processMachine!=0xAA64 && processMachine!=0xA641)
+                throw new PlatformNotSupportedException("Unsupported PowerShell architecture: "+MachineName(processMachine));
+            return "Version=2.0; NativeOS="+MachineName(nativeMachine)+"; Process="+
+                MachineName(processMachine==0?nativeMachine:processMachine)+"; WOWMachine="+
+                MachineName(processMachine)+"; PointerBytes="+IntPtr.Size;
+        }
+        public static ulong MaximumUserAddress() {
+            SystemInfo info; GetSystemInfo(out info);
+            ulong maximum=unchecked((ulong)info.MaximumApplicationAddress.ToInt64());
+            if(maximum<0xFFFFFFFFUL || maximum>=0x8000000000000000UL)
+                throw new PlatformNotSupportedException("Unexpected 64-bit maximum application address: "+maximum.ToString("X16"));
+            return maximum;
+        }
+        public static bool IsKernelImageAddress(ulong address,ulong maximumUserAddress) {
+            // Classify valid ETW image bases using the OS-reported user-space limit.
+            return address>maximumUserAddress;
+        }
         [StructLayout(LayoutKind.Sequential)] struct Privilege {
             public uint Count; public uint LuidLow; public int LuidHigh; public uint Attributes;
         }
@@ -75,7 +139,7 @@ namespace DriverCanary {
         [DllImport("advapi32.dll",SetLastError=true)]
         static extern bool AdjustTokenPrivileges(IntPtr token,bool disable,ref Privilege state,uint length,IntPtr previous,IntPtr needed);
         [DllImport("psapi.dll",SetLastError=true)]
-        static extern bool EnumDeviceDrivers(IntPtr[] addresses,uint bytes,out uint needed);
+        static extern bool EnumDeviceDrivers([Out] IntPtr[] addresses,uint bytes,out uint needed);
         [DllImport("psapi.dll",CharSet=CharSet.Unicode,SetLastError=true)]
         static extern uint GetDeviceDriverFileName(IntPtr address,StringBuilder name,uint size);
         public static string[] LoadedDriverPaths() {
@@ -216,7 +280,7 @@ namespace DriverCanary {
     }
     public sealed class Monitor : IDisposable {
         public const string SessionName="DriverCanary-KernelImages";
-        // EVENT_TRACE_PROPERTIES and EVENT_TRACE_LOGFILEW, Windows x64 ABI.
+        // EVENT_TRACE_PROPERTIES and EVENT_TRACE_LOGFILEW, Windows x64 / ARM64 ABI.
         [StructLayout(LayoutKind.Explicit,Size=120)] struct Properties {
             [FieldOffset(0)] public uint Size;
             [FieldOffset(24)] public Guid Guid;
@@ -263,6 +327,7 @@ namespace DriverCanary {
         readonly BlockingCollection<Notice> output=new BlockingCollection<Notice>(8192);
         readonly HashSet<string> approved=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         readonly string token,endpoint;
+        readonly ulong maximumUserAddress;
         EventCallback callback;
         Thread consumer,worker,sender;
         ulong session,trace=UInt64.MaxValue;
@@ -271,8 +336,19 @@ namespace DriverCanary {
         public volatile string FatalError;
         public long Dropped,DecodeErrors;
         public Monitor(string[] keys,string token,string endpoint) {
+            ValidateInterop();
+            maximumUserAddress=Native.MaximumUserAddress();
             this.token=Native.CheckToken(token); this.endpoint=endpoint;
             foreach(string k in keys) approved.Add(k);
+        }
+        public static string ValidateInterop() {
+            if(IntPtr.Size!=8 || Marshal.SizeOf(typeof(Properties))!=120 ||
+                Marshal.SizeOf(typeof(LogFile))!=448 || Marshal.SizeOf(typeof(Record))!=112 ||
+                Marshal.SizeOf(typeof(PropertyData))!=16 ||
+                Marshal.OffsetOf(typeof(LogFile),"Callback").ToInt32()!=424 ||
+                Marshal.OffsetOf(typeof(Record),"Opcode").ToInt32()!=45)
+                throw new PlatformNotSupportedException("Unexpected ETW interop layout");
+            return "64-bit ETW layouts: Properties=120; LogFile=448; Record=112; PropertyData=16";
         }
         void Publish(Notice n) { if(!output.TryAdd(n)) Interlocked.Increment(ref Dropped); }
         byte[] GetProperty(IntPtr r,string name) {
@@ -293,9 +369,10 @@ namespace DriverCanary {
                 // 10 is a new load; 3 is startup rundown (existing images), tagged separately.
                 if(r.Opcode!=10 && r.Opcode!=3) return;
                 byte[] addr=GetProperty(pointer,"ImageBase");
+                if(addr.Length!=4 && addr.Length!=8) throw new IOException("Unexpected ETW ImageBase width: "+addr.Length);
                 ulong imageBase=addr.Length==8 ? BitConverter.ToUInt64(addr,0) : BitConverter.ToUInt32(addr,0);
-                // x64 kernel virtual addresses, not a .sys suffix or header process ID heuristic.
-                if(imageBase<0xFFFF000000000000UL) return;
+                // TDH supplies event pointer width independently of process/host ISA.
+                if(!Native.IsKernelImageAddress(imageBase,maximumUserAddress)) return;
                 string path=Encoding.Unicode.GetString(GetProperty(pointer,"FileName")).TrimEnd('\0');
                 uint pid=BitConverter.ToUInt32(GetProperty(pointer,"ProcessId"),0);
                 Notice n=new Notice {Kind="Load",EventId=Guid.NewGuid().ToString("N").Substring(0,16),
@@ -397,6 +474,9 @@ namespace DriverCanary {
 }
 '@
 }
+$architectureReport = [DriverCanary.Native]::PlatformInfo()
+[DriverCanary.Monitor]::ValidateInterop() | Out-Null
+Write-Verbose $architectureReport
 
 function Write-JsonFile($Object, [string]$Path) {
     $parent = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
@@ -442,6 +522,15 @@ function Write-Log($Object) {
 
 switch ($Mode) {
     'SelfTest' {
+        Write-Output $architectureReport
+        Write-Output ([DriverCanary.Monitor]::ValidateInterop())
+        $maxUser=[DriverCanary.Native]::MaximumUserAddress()
+        if([DriverCanary.Native]::IsKernelImageAddress($maxUser,$maxUser) -or
+            [DriverCanary.Native]::IsKernelImageAddress(0,$maxUser) -or
+            -not [DriverCanary.Native]::IsKernelImageAddress([UInt64]::MaxValue,$maxUser)) {
+            throw 'Kernel image address boundary test failed'
+        }
+        Write-Output ('MaximumUserAddress=0x{0:X16}; address boundary checks passed' -f $maxUser)
         $vectors=@{ ''=''; 'f'='MY'; 'fo'='MZXQ'; 'foo'='MZXW6'; 'foob'='MZXW6YQ';
             'fooba'='MZXW6YTB'; 'foobar'='MZXW6YTBOI' }
         foreach($v in $vectors.GetEnumerator()) {
@@ -475,7 +564,7 @@ switch ($Mode) {
         }
         $files=@(foreach($p in $paths) { Get-DriverMetadata $p })
         $files=@($files | Sort-Object Path,RawPath -Unique)
-        $inventory=[ordered]@{ SchemaVersion=1; Endpoint=$env:COMPUTERNAME; CreatedUtc=[DateTime]::UtcNow.ToString('o');
+        $inventory=[ordered]@{ SchemaVersion=1; Endpoint=$env:COMPUTERNAME; Platform=$architectureReport; CreatedUtc=[DateTime]::UtcNow.ToString('o');
             ScanRoots=$roots; ScanErrors=@($scanErrors | ForEach-Object { $_.ToString() });
             Services=$services; LoadedDriverPaths=$loaded; PnpDriverPackages=$pnp; Drivers=$files }
         Write-JsonFile $inventory $InventoryPath
@@ -521,6 +610,7 @@ switch ($Mode) {
         try {
             $monitor.Start()
             Write-Log @{Kind='MonitorStarted';Utc=[DateTime]::UtcNow.ToString('o');Endpoint=$env:COMPUTERNAME;
+                Platform=$architectureReport;MaximumUserAddress=('0x{0:X16}' -f [DriverCanary.Native]::MaximumUserAddress());
                 BaselinePath=$BaselinePath;BaselineSHA256=[DriverCanary.Native]::Hash($BaselinePath)}
             Write-Host 'ETW active. Awaiting kernel image loads; startup rundown is reported separately. Ctrl+C stops.'
             $healthAt=[DateTime]::UtcNow

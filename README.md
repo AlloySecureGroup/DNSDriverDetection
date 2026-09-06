@@ -1,21 +1,43 @@
-# DriverCanary
+# DriverCanary 2.0 — x64 and ARM64
 
 A single PowerShell script that inventories Windows kernel drivers, builds an explicitly reviewed path/SHA-256 allowlist, and sends a DNS Canarytoken query when ETW reports an unapproved kernel image load. The endpoint name and driver filename are encoded in the query.
 
-**Validation status:** this package was prepared on macOS. Windows compilation, ETW delivery, and end-to-end Canarytoken receipt have **not** been executed here. Complete the Windows acceptance test below before deployment. This is a detection prototype, not a guaranteed defense against an EDR killer.
+**Validation status:** this package was prepared on macOS. The native layout declarations were cross-checked with Clang targeting Windows x64 and Windows ARM64. PowerShell/C# compilation on Windows, ETW delivery, and end-to-end Canarytoken receipt have **not** been executed here, including in Parallels. Complete the Windows acceptance test below before deployment. This is a detection prototype, not a guaranteed defense against an EDR killer.
 
 ## Requirements and timing
 
-- x64 Windows 10 or Windows 11, running native **64-bit Windows PowerShell 5.1** as administrator. This implementation deliberately excludes 32-bit Windows and ARM64.
+- Target environments: x64 Windows 10 (1709 or later)/11, and **ARM64 Windows 11, including Parallels guests on Apple silicon**. Run **64-bit Windows PowerShell 5.1** as administrator inside Windows. Native ARM64 PowerShell is preferred on ARM64; a 64-bit x64 process on ARM64 is also admitted by the architecture check. Both require the Windows acceptance test. 32-bit processes remain excluded.
 - FullLanguage mode and permission to use `Add-Type`. Follow your organization's script-signing policy; do not disable application control or change machine-wide execution policy for this script.
 - A DNS Canarytoken hostname and working recursive DNS. No Python, Sysmon, SDK, external PowerShell module, or additional monitoring driver is needed. Embedded C# compiles using the Windows-provided .NET Framework.
 - Inventory enables the caller's SeDebugPrivilege to enumerate loaded drivers, including on Windows 11 24H2. It does not change account rights or grant a missing privilege. Run inventory in a dedicated PowerShell process and close it afterwards. [Microsoft: EnumDeviceDrivers](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-enumdevicedrivers)
 
-The script starts its own named system ETW session and consumes kernel image events through the native ETW/TDH APIs. It filters on x64 kernel virtual image addresses rather than filename extensions. Load opcode 10 means a new load; opcode 3 means an image reported in startup rundown. The latter is also checked and alerted, but labeled `ExistingAtTraceStart` in enrichment records. User-mode DLL loads are excluded. [Microsoft: image events](https://learn.microsoft.com/en-us/windows/win32/etw/image-load), [system trace sessions](https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-a-systemtraceprovider-session)
+The script starts its own named system ETW session and consumes kernel image events through the native ETW/TDH APIs. It filters valid image addresses against the user-space limit reported by Windows rather than using filename extensions or a fixed x64 address threshold. TDH supplies each event property's pointer width, independently of the consumer architecture. Load opcode 10 means a new load; opcode 3 means an image reported in startup rundown. The latter is also checked and alerted, but labeled `ExistingAtTraceStart` in enrichment records. User-mode DLL loads are excluded. [Microsoft: image events](https://learn.microsoft.com/en-us/windows/win32/etw/image-load), [system trace sessions](https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-a-systemtraceprovider-session)
 
 **“Immediate” means dispatch as soon as the event is delivered and the allowlist decision is made.** ETW uses a one-second buffer flush interval; scheduling, file reads, existing work, DNS retries, and Canarytoken notification processing can add latency. There is no strict upper bound. This is not WMI polling, a service-install event trigger, or a periodic inventory comparison. [Microsoft: ETW properties and buffering](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties)
 
 ## 1. Prepare a protected working directory
+
+### Architecture and Parallels setup
+
+Version 2.0 uses `IsWow64Process2` to identify the Windows guest architecture, rather than trusting environment variables or inferring architecture from the Mac host. The native interop declarations use the 64-bit layouts shared by x64 and ARM64; no x64 machine code or x64 driver is embedded. [Microsoft: architecture detection](https://learn.microsoft.com/en-us/windows/win32/api/wow64apiset/nf-wow64apiset-iswow64process2), [Windows ARM64 ABI](https://learn.microsoft.com/en-us/cpp/build/arm64-windows-abi-conventions?view=msvc-170)
+
+Inside the Windows 11 ARM guest, extract this ZIP to a local Windows directory, such as `C:\Tools\DriverCanary`. Close PowerShell windows that loaded an older version, then start an elevated **Windows PowerShell** window. Avoid PowerShell (x86). From a 64-bit Windows shell you can launch the Windows-provided PowerShell with:
+
+```powershell
+Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Verb RunAs
+```
+
+If the script reports a **32-bit process**, run the following from that 32-bit shell instead:
+
+```powershell
+Start-Process -FilePath "$env:SystemRoot\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -Verb RunAs
+```
+
+`Sysnative` lets a 32-bit process reach the native system directory; it is not available from a 64-bit shell. [Microsoft: filesystem redirection](https://learn.microsoft.com/en-us/windows/win32/winprog64/file-system-redirector)
+
+Use local Windows storage for deployment and logs, rather than a Parallels shared Mac folder, so Windows ACLs protect the allowlist. Create a **fresh inventory in the ARM guest**; do not reuse an x64 endpoint's approvals. Parallels Tools drivers should be reviewed like other guest drivers. The monitor sees drivers loaded inside Windows, not macOS host extensions.
+
+Run `-Mode SelfTest` first. Expect a platform line containing `NativeOS=ARM64` and `PointerBytes=8`, successful structure checks, and a maximum user address. The reported `Process` can differ from `NativeOS` under emulation. Then run `TestDns` and the ARM Procmon test below. Guest networking, VM pause/resume, and snapshot restoration can affect monitoring continuity and DNS delivery; verify health and receipt after those operations.
 
 Extract this ZIP. Open native Windows PowerShell as administrator in the extracted folder. Use a new deployment directory, or verify an existing directory contains only your intended files before applying these ACLs:
 
@@ -31,7 +53,7 @@ Set-Location $dest
 
 The SIDs identify SYSTEM and local Administrators without depending on the Windows display language. Inspect existing explicit permissions with `icacls.exe $dest`; the command above removes inherited permissions but does not remove unrelated explicit grants already present. Keep the script, inventory, allowlist, logs, and any custom data directories writable only by trusted administrators/SYSTEM.
 
-`SelfTest` compiles the embedded code and checks Base32 test vectors and DNS length limits without sending DNS. It does **not** test ETW or load a driver.
+`SelfTest` compiles the embedded code and checks native architecture detection, interop sizes/offsets, OS-reported address boundaries, Base32 vectors, and DNS length limits without sending DNS. It does **not** start ETW or load a driver. Passing it is a prerequisite, not a replacement for the end-to-end load test.
 
 ## 2. Inventory and review
 
@@ -122,15 +144,19 @@ Use a disposable Windows VM with a snapshot. Use a current legitimate Procmon bu
 3. Start DriverCanary in one elevated PowerShell window and wait for `ETW active`. Run these commands in a second elevated window:
 
 ```powershell
-Get-AuthenticodeSignature 'C:\Tools\ProcessMonitor\Procmon64.exe' |
+# Windows 11 ARM / Parallels:
+$procmon = 'C:\Tools\ProcessMonitor\Procmon64a.exe'
+# On x64 Windows, set $procmon to 'C:\Tools\ProcessMonitor\Procmon64.exe'.
+if (-not (Test-Path -LiteralPath $procmon)) { throw 'Extract the Procmon executable for this Windows architecture first.' }
+Get-AuthenticodeSignature $procmon |
     Format-List Status,SignerCertificate
 
 # Run after reviewing the signature and accepting the Sysinternals license.
 $testStarted = [DateTime]::UtcNow
-Start-Process 'C:\Tools\ProcessMonitor\Procmon64.exe' -ArgumentList '/AcceptEula','/Quiet','/Minimized'
+Start-Process $procmon -ArgumentList '/AcceptEula','/Quiet','/Minimized'
 ```
 
-Starting Procmon should load its signed kernel driver if it is not already loaded and Windows permits the load. The monitor must show a **new** load for the actual Procmon driver path. Copying the executable or registering a service is not sufficient evidence.
+Use `Procmon64a.exe` on ARM64 and `Procmon64.exe` on x64, as specified in [Microsoft's Procmon instructions](https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/troubleshoot-apps-start-failure-use-process-monitor). User-mode x64 emulation is not a way to load an x64 kernel driver into ARM64 Windows. Starting the architecture-matched Procmon should load its signed kernel driver if it is not already loaded and Windows permits the load. The monitor must show a **new** load for the actual Procmon driver path. Copying the executable or registering a service is not sufficient evidence.
 
 Inspect the log after giving enrichment time to finish:
 
@@ -153,7 +179,7 @@ Pass criteria: a post-test `Load` with opcode 10 and `Approved=false`; a matchin
 Stop Procmon after the test:
 
 ```powershell
-& 'C:\Tools\ProcessMonitor\Procmon64.exe' /Terminate /Quiet
+& $procmon /Terminate /Quiet
 ```
 
 This terminates Procmon instances, so use it only in the test VM. Reboot or restore the snapshot before repeating a first-load test. Microsoft documents Procmon launch/termination commands in its [troubleshooting guide](https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/troubleshoot-apps-start-failure-use-process-monitor).
